@@ -11,8 +11,8 @@ func TestHNSWInitialization(t *testing.T) {
 	if idx.config.M != 16 {
 		t.Errorf("Expected M=16, got %d", idx.config.M)
 	}
-	if idx.currentMaxLevel != -1 {
-		t.Errorf("Expected empty graph level -1, got %d", idx.currentMaxLevel)
+	if idx.maxLevel != -1 {
+		t.Errorf("Expected empty graph level -1, got %d", idx.maxLevel)
 	}
 }
 
