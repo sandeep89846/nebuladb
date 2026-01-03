@@ -8,75 +8,74 @@ import (
 	"github.com/sandeep89846/nebuladb/pkg/vec"
 )
 
-// Configuration for HNSW hyperparmeters.
 type Config struct {
-	// M : the maximum number of connections per element per layer.
-	M int
-
-	// EfConstrction : size of dynamic candidate list.
-	EfConstrction int
-
-	// M0 : max connections in the bottom layer.
-	M0 int
-
-	// parameter for random level generation
-	LevelMultiplier float64
+	M               int     // Max connections per layer
+	M0              int     // Max connections at Layer 0 (usually 2*M)
+	EfConstruction  int     // Search range during insertion
+	LevelMultiplier float64 // Probabilistic factor
 }
 
-// Default config.
 func DefaultConfig() Config {
 	m := 16
 	return Config{
 		M:               m,
-		M0:              2 * m,
-		EfConstrction:   200,
-		LevelMultiplier: 1.0 / math.Log(float64(m)), // 0.25 here.
+		M0:              m * 2,
+		EfConstruction:  200,
+		LevelMultiplier: 1.0 / math.Log(float64(m)),
 	}
 }
 
-// Node is a point in the HNSW graph.
 type Node struct {
 	id    uint64
 	level int
 	vec   vec.Vector
 
-	// adj list of neighbors.
+	// adj list representation.
 	neighbors [][]uint64
 
-	// lock to protect neighbors list during insertions.
-	lock sync.RWMutex
+	mu sync.RWMutex
 }
 
-// HNSW : the index structure.
 type HNSW struct {
 	config Config
 
-	//entryPointID : First node through which search or insertions work through.
-	entryPointID uint64 // needs atomic access for updation.
+	idToInternal map[string]uint64
+	internalToID map[uint64]string
+	nextID       uint64 // Atomic counter
 
-	currentMaxLevel int64 // needs atomic access for updation.
+	nodes        map[uint64]*Node
+	entryPointID uint64
+	maxLevel     int // Current highest layer
 
-	nodes map[uint64]*Node
-
-	nextId uint64
-
-	globalLock sync.RWMutex // Need to change later.
+	// globalLock protects the map structure and entryPoint
+	globalLock sync.RWMutex
 }
 
-// NewHNSW creates a new index
 func NewHNSW(cfg Config) *HNSW {
 	return &HNSW{
-		config:          cfg,
-		nodes:           make(map[uint64]*Node),
-		currentMaxLevel: -1, // Empty graph has no levels
-		entryPointID:    0,
+		config:       cfg,
+		idToInternal: make(map[string]uint64),
+		internalToID: make(map[uint64]string),
+		nodes:        make(map[uint64]*Node),
+		maxLevel:     -1,
+		nextID:       0,
 	}
 }
 
+// randomLevel determines the height of a new node.
 func (h *HNSW) randomLevel() int {
 	lvl := 0
-	for rand.Float64() < 0.5 { // Simplified probability; we'll refine this
+	for rand.Float64() < 0.5 {
 		lvl++
 	}
 	return lvl
+}
+
+// dist calculates "Cosine Distance" (1 - Similarity).
+func (h *HNSW) dist(v1, v2 vec.Vector) float32 {
+	sim, _ := vec.CosineSimilarity(v1, v2)
+	// Convert Similarity (-1 to 1) to Distance (0 to 2)
+	// 1.0 sim -> 0.0 dist (Close)
+	// -1.0 sim -> 2.0 dist (Far)
+	return 1.0 - sim
 }
