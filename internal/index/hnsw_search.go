@@ -1,116 +1,351 @@
 package index
 
 import (
-	"container/heap"
+	"sync"
 
 	"github.com/sandeep89846/nebuladb/pkg/vec"
 )
 
+// candidate represents a node traversed during search.
 type candidate struct {
 	id   uint64
 	dist float32
 }
 
-// Priority Queue for Candidates -- Min Heap over their distances.
-type candidateQueue []candidate
+// ---------------------------
+// minPQ (typed min-heap)
+// ---------------------------
 
-func (cq candidateQueue) Len() int           { return len(cq) }
-func (cq candidateQueue) Less(i, j int) bool { return cq[i].dist < cq[j].dist } // Min distance first
-func (cq candidateQueue) Swap(i, j int)      { cq[i], cq[j] = cq[j], cq[i] }
-
-func (cq *candidateQueue) Push(x any) {
-	*cq = append(*cq, x.(candidate))
+type minPQ struct {
+	items []candidate
 }
 
-func (cq *candidateQueue) Pop() any {
-	old := *cq
-	n := len(old)
-	item := old[n-1]
-	*cq = old[0 : n-1]
-	return item
+func (p *minPQ) Len() int { return len(p.items) }
+
+func (p *minPQ) Push(c candidate) {
+	p.items = append(p.items, c)
+	p.siftUp(len(p.items) - 1)
 }
 
-// Max-Heap (Reverse of above)
-// to track the "Furthest" element in our top-k list (so we can discard it).
-type resultQueue []candidate
-
-func (rq resultQueue) Len() int           { return len(rq) }
-func (rq resultQueue) Less(i, j int) bool { return rq[i].dist > rq[j].dist } // Max distance first
-func (rq resultQueue) Swap(i, j int)      { rq[i], rq[j] = rq[j], rq[i] }
-func (rq *resultQueue) Push(x any)        { *rq = append(*rq, x.(candidate)) }
-func (rq *resultQueue) Pop() any {
-	old := *rq
-	n := len(old)
-	item := old[n-1]
-	*rq = old[0 : n-1]
-	return item
-}
-
-func (h *HNSW) searchLayer(query vec.Vector, entryPointIDs []uint64, ef int, layer int) *resultQueue {
-	// needs Optimization later on.
-	visited := make(map[uint64]bool)
-
-	candidates := &candidateQueue{}
-	heap.Init(candidates)
-
-	results := &resultQueue{}
-	heap.Init(results)
-
-	// Initialize with entry points
-	for _, epID := range entryPointIDs {
-		h.globalLock.RLock()
-		node := h.nodes[epID]
-		h.globalLock.RUnlock()
-
-		d := h.dist(query, node.vec)
-
-		visited[epID] = true
-		heap.Push(candidates, candidate{id: epID, dist: d})
-		heap.Push(results, candidate{id: epID, dist: d})
+func (p *minPQ) Pop() candidate {
+	n := len(p.items)
+	if n == 0 {
+		return candidate{}
 	}
+	if n == 1 {
+		x := p.items[0]
+		p.items = p.items[:0]
+		return x
+	}
+	// pop root
+	root := p.items[0]
+	// move last to root and sift down
+	last := p.items[n-1]
+	p.items[n-1] = candidate{} // help GC
+	p.items = p.items[:n-1]
+	p.items[0] = last
+	p.siftDown(0)
+	return root
+}
 
-	for candidates.Len() > 0 {
+func (p *minPQ) Peek() (candidate, bool) {
+	if len(p.items) == 0 {
+		return candidate{}, false
+	}
+	return p.items[0], true
+}
 
-		curr := heap.Pop(candidates).(candidate)
+func (p *minPQ) Reset() {
+	p.items = p.items[:0]
+}
 
-		furthestResult := (*results)[0]
-		if curr.dist > furthestResult.dist && results.Len() >= ef {
+func (p *minPQ) siftUp(i int) {
+	for i > 0 {
+		parent := (i - 1) / 2
+		if p.items[i].dist < p.items[parent].dist {
+			p.items[i], p.items[parent] = p.items[parent], p.items[i]
+			i = parent
+			continue
+		}
+		break
+	}
+}
+
+func (p *minPQ) siftDown(i int) {
+	n := len(p.items)
+	for {
+		l := 2*i + 1
+		if l >= n {
 			break
 		}
+		smallest := l
+		r := l + 1
+		if r < n && p.items[r].dist < p.items[l].dist {
+			smallest = r
+		}
+		if p.items[smallest].dist < p.items[i].dist {
+			p.items[i], p.items[smallest] = p.items[smallest], p.items[i]
+			i = smallest
+			continue
+		}
+		break
+	}
+}
 
-		h.globalLock.RLock()
-		currNode := h.nodes[curr.id]
-		// We lock the node to read its neighbors safely
+// ---------------------------
+// maxBoundedPQ (typed bounded max-heap)
+// Keeps at most capacity items. Root is the maximum (furthest) distance.
+// Push semantics:
+//   - If len < cap: append and sift up.
+//   - Else: if new.dist < root.dist -> replace root and sift down.
+// ---------------------------
+
+type maxBoundedPQ struct {
+	items    []candidate
+	capacity int
+}
+
+func newMaxBoundedPQ(cap int) *maxBoundedPQ {
+	if cap <= 0 {
+		cap = 1
+	}
+	return &maxBoundedPQ{
+		items:    make([]candidate, 0, cap),
+		capacity: cap,
+	}
+}
+
+func (p *maxBoundedPQ) Len() int { return len(p.items) }
+
+func (p *maxBoundedPQ) capacityReached() bool {
+	return len(p.items) >= p.capacity
+}
+
+// root is the maximum (furthest) candidate
+func (p *maxBoundedPQ) Peek() (candidate, bool) {
+	if len(p.items) == 0 {
+		return candidate{}, false
+	}
+	return p.items[0], true
+}
+
+func (p *maxBoundedPQ) Push(c candidate) {
+	n := len(p.items)
+	if n < p.capacity {
+		p.items = append(p.items, c)
+		p.siftUpMax(n)
+		return
+	}
+	// capacity reached
+	if n == 0 {
+		return
+	}
+	// if new is closer than current furthest (root), replace root and sift down
+	if c.dist < p.items[0].dist {
+		p.items[0] = c
+		p.siftDownMax(0)
+	}
+}
+
+func (p *maxBoundedPQ) Pop() candidate {
+	n := len(p.items)
+	if n == 0 {
+		return candidate{}
+	}
+	if n == 1 {
+		x := p.items[0]
+		p.items = p.items[:0]
+		return x
+	}
+	root := p.items[0]
+	last := p.items[n-1]
+	p.items[n-1] = candidate{} // help GC
+	p.items = p.items[:n-1]
+	p.items[0] = last
+	p.siftDownMax(0)
+	return root
+}
+
+// PopAll returns items in order Root->... i.e., furthest -> closest
+func (p *maxBoundedPQ) PopAll() []candidate {
+	out := make([]candidate, 0, len(p.items))
+	for p.Len() > 0 {
+		out = append(out, p.Pop())
+	}
+	return out
+}
+
+func (p *maxBoundedPQ) Reset(capacity int) {
+	p.capacity = capacity
+	p.items = p.items[:0]
+	// ensure capacity
+	if cap(p.items) < capacity {
+		p.items = make([]candidate, 0, capacity)
+	}
+}
+
+func (p *maxBoundedPQ) siftUpMax(i int) {
+	for i > 0 {
+		parent := (i - 1) / 2
+		if p.items[i].dist > p.items[parent].dist {
+			p.items[i], p.items[parent] = p.items[parent], p.items[i]
+			i = parent
+			continue
+		}
+		break
+	}
+}
+
+func (p *maxBoundedPQ) siftDownMax(i int) {
+	n := len(p.items)
+	for {
+		l := 2*i + 1
+		if l >= n {
+			break
+		}
+		largest := l
+		r := l + 1
+		if r < n && p.items[r].dist > p.items[l].dist {
+			largest = r
+		}
+		if p.items[largest].dist > p.items[i].dist {
+			p.items[i], p.items[largest] = p.items[largest], p.items[i]
+			i = largest
+			continue
+		}
+		break
+	}
+}
+
+// ---------------------------
+// Pools
+// ---------------------------
+
+var candidatePool = sync.Pool{
+	New: func() any {
+		p := &minPQ{items: make([]candidate, 0, 64)}
+		return p
+	},
+}
+
+var resultPool = sync.Pool{
+	New: func() any {
+		// default capacity 64; reset with desired ef on use
+		return newMaxBoundedPQ(64)
+	},
+}
+
+var visitedPool = sync.Pool{
+	New: func() any { m := make(map[uint64]bool); return &m },
+}
+
+// ---------------------------
+// searchLayer (uses typed heaps)
+// ---------------------------
+
+// searchLayer performs a greedy graph traversal at a specific layer.
+// Returns a bounded max-heap of the best 'ef' nodes found.
+//
+// NOTE: results (the returned *maxBoundedPQ) is NOT pooled for reuse by the
+// caller; we do return a heap instance but it was acquired from resultPool.
+// Caller is allowed to consume it (Pop/PopAll). We put it back into pool when done
+// in internal users (where safe). Here we return it to the caller.
+func (h *HNSW) searchLayer(query vec.Vector, entryPointIDs []uint64, ef int, layer int) *maxBoundedPQ {
+	// Acquire candidate queue from pool and reset it.
+	cp := candidatePool.Get().(*minPQ)
+	cp.Reset()
+
+	// Acquire visited map from pool and reset it.
+	vp := visitedPool.Get().(*map[uint64]bool)
+	visited := *vp
+	for k := range visited {
+		delete(visited, k)
+	}
+
+	// Acquire result PQ from pool and reset with capacity ef
+	rp := resultPool.Get().(*maxBoundedPQ)
+	rp.Reset(ef)
+
+	// 1. Initialize with entry points
+	for _, epID := range entryPointIDs {
+		node := h.nodeByID(epID)
+		if node == nil {
+			continue
+		}
+
+		dist := h.dist(query, node.vec)
+		visited[epID] = true
+
+		c := candidate{id: epID, dist: dist}
+		cp.Push(c)
+		rp.Push(c)
+	}
+
+	// 2. The Greedy Loop
+	for cp.Len() > 0 {
+		// Explore the closest candidate first
+		curr := cp.Pop()
+
+		// Optimization: If the closest candidate is already further away
+		// than the worst node in our result list, and our result list is full,
+		// then there is no point exploring further down this path.
+		if rp.Len() >= ef {
+			if root, ok := rp.Peek(); ok {
+				if curr.dist > root.dist {
+					break
+				}
+			}
+		}
+
+		currNode := h.nodeByID(curr.id)
+		if currNode == nil {
+			continue
+		}
+
+		// Read neighbors safely by copying the neighbor IDs
 		currNode.mu.RLock()
-		neighbors := currNode.neighbors[layer]
+		if layer >= len(currNode.neighbors) {
+			currNode.mu.RUnlock()
+			continue
+		}
+		neighbors := make([]uint64, len(currNode.neighbors[layer]))
+		copy(neighbors, currNode.neighbors[layer])
 		currNode.mu.RUnlock()
-		h.globalLock.RUnlock()
 
-		for _, neighborID := range neighbors {
+		// Snapshot neighbor node pointers in one RLock (helper)
+		neighborNodes := h.snapshotNodes(neighbors)
+
+		for _, neighborNode := range neighborNodes {
+			neighborID := neighborNode.id
 			if visited[neighborID] {
 				continue
 			}
 			visited[neighborID] = true
 
-			h.globalLock.RLock()
-			neighborNode := h.nodes[neighborID]
-			h.globalLock.RUnlock()
-
 			d := h.dist(query, neighborNode.vec)
 
-			// If the result list isn't full, just add it
-			// OR if this neighbor is closer than the worst result we have
-			if results.Len() < ef || d < (*results)[0].dist {
-				heap.Push(candidates, candidate{id: neighborID, dist: d})
-				heap.Push(results, candidate{id: neighborID, dist: d})
-
-				// If we have too many results, remove the worst one
-				if results.Len() > ef {
-					heap.Pop(results)
+			// If rp isn't full yet OR this candidate is better than the worst
+			if rp.Len() < ef {
+				cp.Push(candidate{id: neighborID, dist: d})
+				rp.Push(candidate{id: neighborID, dist: d})
+			} else {
+				if root, ok := rp.Peek(); ok && d < root.dist {
+					cp.Push(candidate{id: neighborID, dist: d})
+					rp.Push(candidate{id: neighborID, dist: d}) // rp.Push will replace root if needed
 				}
 			}
 		}
-
 	}
-	return results
+
+	// Return candidate queue & visited map to pools (after clearing visited).
+	cp.Reset()
+	candidatePool.Put(cp)
+
+	for k := range visited {
+		delete(visited, k)
+	}
+	visitedPool.Put(&visited)
+
+	// Return rp to caller. Caller should consume/pop it.
+	return rp
 }

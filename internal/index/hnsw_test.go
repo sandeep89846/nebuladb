@@ -1,34 +1,227 @@
 package index
 
 import (
+	"fmt"
+	"math/rand"
+	"sync"
 	"testing"
+
+	"github.com/sandeep89846/nebuladb/pkg/vec"
 )
 
-func TestHNSWInitialization(t *testing.T) {
+func init() {
+	// deterministic tests / benchmarks
+	rand.Seed(42)
+}
+
+// --- Helper Functions ---
+
+func randomVec(dim int) vec.Vector {
+	v := make(vec.Vector, dim)
+	for i := range v {
+		v[i] = rand.Float32()
+	}
+	return v
+}
+
+// --- Functional Tests ---
+
+func TestHNSW_Sanity(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.M = 10
+	cfg.EfConstruction = 50
 	idx := NewHNSW(cfg)
 
-	if idx.config.M != 16 {
-		t.Errorf("Expected M=16, got %d", idx.config.M)
+	// 1. Insert 100 vectors
+	dim := 128
+	for i := 0; i < 100; i++ {
+		err := idx.Insert(fmt.Sprintf("vec_%d", i), randomVec(dim))
+		if err != nil {
+			t.Fatalf("Insert failed: %v", err)
+		}
 	}
-	if idx.maxLevel != -1 {
-		t.Errorf("Expected empty graph level -1, got %d", idx.maxLevel)
+
+	targetID := "vec_50"
+
+	idx.globalLock.RLock()
+	internalID := idx.idToInternal[targetID]
+	idx.globalLock.RUnlock()
+
+	targetVecNode := idx.nodeByID(internalID)
+	if targetVecNode == nil {
+		t.Fatalf("internal node not found for %s", targetID)
+	}
+	targetVec := targetVecNode.vec
+
+	results, err := idx.Search(targetVec, 5)
+	if err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+
+	if len(results) == 0 {
+		t.Fatal("Got 0 results")
+	}
+
+	if results[0].ID != targetID {
+		t.Errorf("Top result should be %s, got %s", targetID, results[0].ID)
+	}
+
+	if results[0].Score < 0.999 {
+		t.Errorf("Top result score should be ~1.0, got %f", results[0].Score)
 	}
 }
 
-func TestRandomLevel(t *testing.T) {
-	// This is a probabilistic test, so we just check bounds
+// --- Recall Accuracy Test ---
+func TestHNSW_Recall(t *testing.T) {
+	// Setup
+	count := 1000 // Enough to be interesting, small enough to run fast
+	dim := 64
+	k := 10
+
+	naive := NewNaiveIndex()
+	hnsw := NewHNSW(DefaultConfig())
+
+	fmt.Printf("Generating %d vectors.\n", count)
+
+	// Data generation
+	dataset := make([]vec.Vector, count)
+	for i := 0; i < count; i++ {
+		dataset[i] = randomVec(dim)
+		id := fmt.Sprintf("id_%d", i)
+
+		naive.Insert(id, dataset[i])
+		hnsw.Insert(id, dataset[i])
+	}
+
+	// Test with 50 random queries
+	queries := 50
+	totalRecall := 0.0
+
+	fmt.Println("Running recall queries.")
+
+	for i := 0; i < queries; i++ {
+		query := randomVec(dim)
+
+		// 1. Get Ground Truth
+		truth, _ := naive.Search(query, k)
+
+		// 2. Get HNSW Prediction
+		prediction, _ := hnsw.Search(query, k)
+
+		// 3. Calculate Overlap
+		matches := 0
+		truthMap := make(map[string]bool)
+		for _, m := range truth {
+			truthMap[m.ID] = true
+		}
+
+		for _, m := range prediction {
+			if truthMap[m.ID] {
+				matches++
+			}
+		}
+
+		recall := float64(matches) / float64(k)
+		totalRecall += recall
+	}
+
+	avgRecall := totalRecall / float64(queries)
+	fmt.Printf("Average Recall: %.2f%%\n", avgRecall*100)
+
+	// Threshold: HNSW should be at least 90% accurate by default
+	if avgRecall < 0.9 {
+		t.Errorf("Recall too low: got %.2f, want > 0.9", avgRecall)
+	}
+}
+
+func TestHNSW_ConcurrentStress(t *testing.T) {
+	// 1. Setup
 	cfg := DefaultConfig()
 	idx := NewHNSW(cfg)
+	dim := 128
 
-	for i := 0; i < 1000; i++ {
-		lvl := idx.randomLevel()
-		if lvl < 0 {
-			t.Errorf("Level cannot be negative: %d", lvl)
-		}
-		// It's statistically very unlikely to get > 20 levels for M=16
-		if lvl > 20 {
-			t.Logf("Got unusually high level: %d", lvl)
-		}
+	// Parameters
+	numInserts := 1000
+	numSearches := 1000
+	concurrency := 10 // 10 threads writing, 10 threads reading
+
+	var wg sync.WaitGroup
+	start := make(chan struct{}) // Coordination signal
+
+	// 2. Writer Goroutines
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			<-start // Wait for signal
+
+			for j := 0; j < numInserts/concurrency; j++ {
+				id := fmt.Sprintf("w_%d_%d", workerID, j)
+				// Ignore errors (duplicates allowed in stress test)
+				_ = idx.Insert(id, randomVec(dim))
+			}
+		}(i)
+	}
+
+	// 3. Reader Goroutines
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(waitgroup int) {
+			defer wg.Done()
+			<-start
+
+			query := randomVec(dim)
+			for j := 0; j < numSearches/concurrency; j++ {
+				matches, err := idx.Search(query, 10)
+				if err != nil {
+					t.Errorf("Search error: %v", err)
+				}
+				// We don't care about results, just that it doesn't Panic or Race
+				_ = matches
+			}
+		}(i)
+	}
+
+	// 4. BLAST OFF
+	close(start)
+	wg.Wait()
+
+	// 5. Verify Graph Integrity
+	// If the graph is broken, counting nodes might fail or panic
+	// We check internal nodes slice length.
+	// Since we inserted numInserts unique items (mostly), we expect roughly that count.
+	if len(idx.nodes) == 0 {
+		t.Error("Graph is empty after inserts")
+	}
+}
+
+// --- Benchmarks ---
+
+func BenchmarkHNSW_Insert(b *testing.B) {
+	idx := NewHNSW(DefaultConfig())
+	dim := 128
+	v := randomVec(dim)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		idx.Insert(fmt.Sprintf("%d", i), v)
+	}
+}
+
+func BenchmarkHNSW_Search(b *testing.B) {
+	// Pre-fill
+	idx := NewHNSW(DefaultConfig())
+	dim := 128
+	count := 10000
+
+	for i := 0; i < count; i++ {
+		idx.Insert(fmt.Sprintf("%d", i), randomVec(dim))
+	}
+
+	query := randomVec(dim)
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		idx.Search(query, 10)
 	}
 }
