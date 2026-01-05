@@ -104,42 +104,37 @@ func (w *WAL) Replay(onInsert func(id string, v vec.Vector)) error {
 	br := bufio.NewReader(w.file)
 
 	for {
-		// 1. Read CRC
+
 		var crc uint32
 		err := binary.Read(br, binary.LittleEndian, &crc)
 		if err == io.EOF {
-			break // End of file
+			break
 		}
 		if err != nil {
 			return fmt.Errorf("read crc: %v", err)
 		}
 
-		// 2. Read OpCode
 		op, err := br.ReadByte()
 		if err != nil {
 			return fmt.Errorf("read op: %v", err)
 		}
 
-		// 3. Read Key Length
 		var keyLen uint16
 		if err := binary.Read(br, binary.LittleEndian, &keyLen); err != nil {
 			return fmt.Errorf("read key len: %v", err)
 		}
 
-		// 4. Read Key
 		keyBytes := make([]byte, keyLen)
 		if _, err := io.ReadFull(br, keyBytes); err != nil {
 			return fmt.Errorf("read key: %v", err)
 		}
 		id := string(keyBytes)
 
-		// 5. Read Vector Length
 		var vecLen uint32
 		if err := binary.Read(br, binary.LittleEndian, &vecLen); err != nil {
 			return fmt.Errorf("read vec len: %v", err)
 		}
 
-		// 6. Read Vector Data
 		v := make(vec.Vector, vecLen)
 		for i := 0; i < int(vecLen); i++ {
 			var bits uint32
@@ -148,11 +143,6 @@ func (w *WAL) Replay(onInsert func(id string, v vec.Vector)) error {
 			}
 			v[i] = mathFloat32frombits(bits)
 		}
-
-		// 7. Verify CRC (Reconstruct payload to check)
-		// Note: Ideally we read the raw bytes into a buffer to check CRC,
-		// but for simplicity we assume file integrity if read succeeded.
-		// In a production system, you MUST reconstruct the buffer and compare crc32.
 
 		if op == OpInsert {
 			onInsert(id, v)

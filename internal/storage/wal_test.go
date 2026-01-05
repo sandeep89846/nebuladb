@@ -8,11 +8,10 @@ import (
 )
 
 func TestWAL_WriteAndReplay(t *testing.T) {
-	// Temp file
+
 	tmpFile := "test_wal.bin"
 	defer os.Remove(tmpFile)
 
-	// 1. Open and Write
 	wal, err := OpenWAL(tmpFile)
 	if err != nil {
 		t.Fatal(err)
@@ -33,7 +32,6 @@ func TestWAL_WriteAndReplay(t *testing.T) {
 	}
 	wal.Close()
 
-	// 2. Reopen and Replay
 	wal2, err := OpenWAL(tmpFile)
 	if err != nil {
 		t.Fatal(err)
