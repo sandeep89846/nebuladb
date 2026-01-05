@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package nebulapb;
+
+option go_package = "github.com/sandeep89846/nebuladb/api/proto/nebulapb";
+
+service VectorService {
+  rpc Insert(InsertRequest) returns (InsertResponse);
+  rpc Search(SearchRequest) returns (SearchResponse);
+}
+
+message Vector {
+  string id = 1;
+  repeated float values = 2;
+}
+
+message InsertRequest {
+  string id = 1;
+  repeated float vector = 2;
+}
+
+message InsertResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message SearchRequest {
+  repeated float vector = 1;
+  int32 k = 2;
+}
+
+message SearchResponse {
+  message Match {
+    string id = 1;
+    float score = 2;
+  }
+  repeated Match matches = 1;
+}
