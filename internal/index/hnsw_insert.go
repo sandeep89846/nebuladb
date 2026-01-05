@@ -10,7 +10,7 @@ import (
 
 // Insert adds a vector to the index.
 func (h *HNSW) Insert(id string, v vec.Vector) error {
-	// 1. Check for duplicate ID (fast RLock)
+
 	h.globalLock.RLock()
 	_, exists := h.idToInternal[id]
 	h.globalLock.RUnlock()
@@ -31,7 +31,6 @@ func (h *HNSW) Insert(id string, v vec.Vector) error {
 		normalized[i] = v[i] / mag
 	}
 
-	// 2. Create the new node
 	internalID := atomic.AddUint64(&h.nextID, 1)
 	level := h.randomLevel()
 
@@ -42,7 +41,6 @@ func (h *HNSW) Insert(id string, v vec.Vector) error {
 		neighbors: make([][]uint64, level+1),
 	}
 
-	// 3. Global State Update
 	h.globalLock.Lock()
 	// Re-check to avoid race where another goroutine inserted same ID
 	if _, exists := h.idToInternal[id]; exists {
@@ -60,7 +58,7 @@ func (h *HNSW) Insert(id string, v vec.Vector) error {
 	} else if idx < len(h.nodes) {
 		h.nodes[idx] = node
 	} else {
-		// Rare: IDs obtained out-of-order (append filler nils)
+		// IDs obtained out-of-order (append filler nils)
 		newNodes := make([]*Node, idx+1)
 		copy(newNodes, h.nodes)
 		newNodes[idx] = node
@@ -79,7 +77,6 @@ func (h *HNSW) Insert(id string, v vec.Vector) error {
 	}
 	h.globalLock.Unlock()
 
-	// 4. Phase 1: Zoom in (No linking)
 	// Find the closest node at the insertion level
 	currObjID := entryPointID
 
@@ -108,7 +105,6 @@ func (h *HNSW) Insert(id string, v vec.Vector) error {
 			copy(neighbors, currNode.neighbors[l])
 			currNode.mu.RUnlock()
 
-			// Batch snapshot neighbor node pointers
 			neighborNodes := h.snapshotNodes(neighbors)
 
 			for _, neighborNode := range neighborNodes {
@@ -123,7 +119,6 @@ func (h *HNSW) Insert(id string, v vec.Vector) error {
 		}
 	}
 
-	// 5. Phase 2: Insert and Link
 	topLevel := int(math.Min(float64(maxLevel), float64(level)))
 
 	for l := topLevel; l >= 0; l-- {
@@ -157,7 +152,6 @@ func (h *HNSW) Insert(id string, v vec.Vector) error {
 		}
 	}
 
-	// 6. Update Entry Point if we inserted at a new highest level
 	h.globalLock.Lock()
 	if level > h.maxLevel {
 		h.maxLevel = level
@@ -170,10 +164,9 @@ func (h *HNSW) Insert(id string, v vec.Vector) error {
 
 // Helper: Pick M closest from a bounded max-heap results
 func (h *HNSW) selectNeighbors(results *maxBoundedPQ, m int) []uint64 {
-	// results is a bounded max-heap. PopAll returns Furthest -> Closest
+
 	temp := results.PopAll()
 
-	// temp is [Furthest, ..., Closest]
 	count := m
 	if len(temp) < m {
 		count = len(temp)
@@ -188,7 +181,6 @@ func (h *HNSW) selectNeighbors(results *maxBoundedPQ, m int) []uint64 {
 }
 
 // addBidirectionalConnection adds guestID as a neighbor of hostID at given layer.
-// It ensures no duplicates and prunes the worst neighbor if the list exceeds the limit.
 func (h *HNSW) addBidirectionalConnection(hostID, guestID uint64, layer int) {
 	hostNode := h.nodeByID(hostID)
 	if hostNode == nil {
@@ -200,7 +192,7 @@ func (h *HNSW) addBidirectionalConnection(hostID, guestID uint64, layer int) {
 
 	// Ensure neighbors slice length
 	if layer >= len(hostNode.neighbors) {
-		// should not happen normally, but defensively extend
+
 		newNeighbors := make([][]uint64, layer+1)
 		copy(newNeighbors, hostNode.neighbors)
 		hostNode.neighbors = newNeighbors
@@ -223,7 +215,7 @@ func (h *HNSW) addBidirectionalConnection(hostID, guestID uint64, layer int) {
 	}
 
 	if len(hostNode.neighbors[layer]) > limit {
-		// Snapshot neighbor IDs and node pointers
+
 		neighbors := make([]uint64, len(hostNode.neighbors[layer]))
 		copy(neighbors, hostNode.neighbors[layer])
 
@@ -243,7 +235,6 @@ func (h *HNSW) addBidirectionalConnection(hostID, guestID uint64, layer int) {
 		if worstIdx != -1 {
 			toRemove := neighbors[worstIdx]
 
-			// Remove toRemove from hostNode.neighbors[layer] by swapping with last
 			l := len(hostNode.neighbors[layer])
 			for i, id := range hostNode.neighbors[layer] {
 				if id == toRemove {

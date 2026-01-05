@@ -45,8 +45,6 @@ type HNSW struct {
 	internalToID map[uint64]string
 	nextID       uint64 // Atomic counter
 
-	// nodes is now a slice indexed by (internalID - 1).
-	// We keep a slice for fast read access (cheaper than map lookups).
 	nodes        []*Node
 	entryPointID uint64
 	maxLevel     int // Current highest layer
@@ -67,8 +65,6 @@ func NewHNSW(cfg Config) *HNSW {
 }
 
 // randomLevel determines the height of a new node using LevelMultiplier.
-// This returns >= 0 and follows an exponential-like distribution.
-// Uses math/rand so tests can seed it deterministically.
 func (h *HNSW) randomLevel() int {
 	mult := h.config.LevelMultiplier
 	if mult <= 0 {
@@ -92,7 +88,7 @@ func (h *HNSW) randomLevel() int {
 
 // fastDot: a simple, fast float32 dot product optimized for typical vector lengths.
 // Assumes both vectors have the same length. If lengths mismatch, returns ok=false.
-// Unrolls loop by 4 for a small speedup.
+// Unrolls loop by 4 for a small speedup (Replacement to earlier Dot func).
 func fastDot(a, b vec.Vector) (float32, bool) {
 	na := len(a)
 	nb := len(b)

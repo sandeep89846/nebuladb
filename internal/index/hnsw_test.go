@@ -102,13 +102,10 @@ func TestHNSW_Recall(t *testing.T) {
 	for i := 0; i < queries; i++ {
 		query := randomVec(dim)
 
-		// 1. Get Ground Truth
 		truth, _ := naive.Search(query, k)
 
-		// 2. Get HNSW Prediction
 		prediction, _ := hnsw.Search(query, k)
 
-		// 3. Calculate Overlap
 		matches := 0
 		truthMap := make(map[string]bool)
 		for _, m := range truth {
@@ -128,14 +125,14 @@ func TestHNSW_Recall(t *testing.T) {
 	avgRecall := totalRecall / float64(queries)
 	fmt.Printf("Average Recall: %.2f%%\n", avgRecall*100)
 
-	// Threshold: HNSW should be at least 90% accurate by default
+	// Threshold
 	if avgRecall < 0.9 {
 		t.Errorf("Recall too low: got %.2f, want > 0.9", avgRecall)
 	}
 }
 
 func TestHNSW_ConcurrentStress(t *testing.T) {
-	// 1. Setup
+
 	cfg := DefaultConfig()
 	idx := NewHNSW(cfg)
 	dim := 128
@@ -143,27 +140,26 @@ func TestHNSW_ConcurrentStress(t *testing.T) {
 	// Parameters
 	numInserts := 1000
 	numSearches := 1000
-	concurrency := 10 // 10 threads writing, 10 threads reading
+	concurrency := 10
 
 	var wg sync.WaitGroup
-	start := make(chan struct{}) // Coordination signal
+	start := make(chan struct{})
 
 	// 2. Writer Goroutines
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			<-start // Wait for signal
+			<-start
 
 			for j := 0; j < numInserts/concurrency; j++ {
 				id := fmt.Sprintf("w_%d_%d", workerID, j)
-				// Ignore errors (duplicates allowed in stress test)
+
 				_ = idx.Insert(id, randomVec(dim))
 			}
 		}(i)
 	}
 
-	// 3. Reader Goroutines
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
 		go func(waitgroup int) {
@@ -176,20 +172,15 @@ func TestHNSW_ConcurrentStress(t *testing.T) {
 				if err != nil {
 					t.Errorf("Search error: %v", err)
 				}
-				// We don't care about results, just that it doesn't Panic or Race
+
 				_ = matches
 			}
 		}(i)
 	}
 
-	// 4. BLAST OFF
 	close(start)
 	wg.Wait()
 
-	// 5. Verify Graph Integrity
-	// If the graph is broken, counting nodes might fail or panic
-	// We check internal nodes slice length.
-	// Since we inserted numInserts unique items (mostly), we expect roughly that count.
 	if len(idx.nodes) == 0 {
 		t.Error("Graph is empty after inserts")
 	}
@@ -209,7 +200,7 @@ func BenchmarkHNSW_Insert(b *testing.B) {
 }
 
 func BenchmarkHNSW_Search(b *testing.B) {
-	// Pre-fill
+
 	idx := NewHNSW(DefaultConfig())
 	dim := 128
 	count := 10000

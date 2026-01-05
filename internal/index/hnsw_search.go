@@ -95,9 +95,6 @@ func (p *minPQ) siftDown(i int) {
 // ---------------------------
 // maxBoundedPQ (typed bounded max-heap)
 // Keeps at most capacity items. Root is the maximum (furthest) distance.
-// Push semantics:
-//   - If len < cap: append and sift up.
-//   - Else: if new.dist < root.dist -> replace root and sift down.
 // ---------------------------
 
 type maxBoundedPQ struct {
@@ -240,16 +237,11 @@ var visitedPool = sync.Pool{
 }
 
 // ---------------------------
-// searchLayer (uses typed heaps)
+// searchLayer (rewirte using typed heaps)
 // ---------------------------
 
 // searchLayer performs a greedy graph traversal at a specific layer.
 // Returns a bounded max-heap of the best 'ef' nodes found.
-//
-// NOTE: results (the returned *maxBoundedPQ) is NOT pooled for reuse by the
-// caller; we do return a heap instance but it was acquired from resultPool.
-// Caller is allowed to consume it (Pop/PopAll). We put it back into pool when done
-// in internal users (where safe). Here we return it to the caller.
 func (h *HNSW) searchLayer(query vec.Vector, entryPointIDs []uint64, ef int, layer int) *maxBoundedPQ {
 	// Acquire candidate queue from pool and reset it.
 	cp := candidatePool.Get().(*minPQ)
@@ -266,7 +258,6 @@ func (h *HNSW) searchLayer(query vec.Vector, entryPointIDs []uint64, ef int, lay
 	rp := resultPool.Get().(*maxBoundedPQ)
 	rp.Reset(ef)
 
-	// 1. Initialize with entry points
 	for _, epID := range entryPointIDs {
 		node := h.nodeByID(epID)
 		if node == nil {
@@ -281,14 +272,10 @@ func (h *HNSW) searchLayer(query vec.Vector, entryPointIDs []uint64, ef int, lay
 		rp.Push(c)
 	}
 
-	// 2. The Greedy Loop
 	for cp.Len() > 0 {
 		// Explore the closest candidate first
 		curr := cp.Pop()
 
-		// Optimization: If the closest candidate is already further away
-		// than the worst node in our result list, and our result list is full,
-		// then there is no point exploring further down this path.
 		if rp.Len() >= ef {
 			if root, ok := rp.Peek(); ok {
 				if curr.dist > root.dist {
@@ -302,7 +289,6 @@ func (h *HNSW) searchLayer(query vec.Vector, entryPointIDs []uint64, ef int, lay
 			continue
 		}
 
-		// Read neighbors safely by copying the neighbor IDs
 		currNode.mu.RLock()
 		if layer >= len(currNode.neighbors) {
 			currNode.mu.RUnlock()
@@ -312,7 +298,6 @@ func (h *HNSW) searchLayer(query vec.Vector, entryPointIDs []uint64, ef int, lay
 		copy(neighbors, currNode.neighbors[layer])
 		currNode.mu.RUnlock()
 
-		// Snapshot neighbor node pointers in one RLock (helper)
 		neighborNodes := h.snapshotNodes(neighbors)
 
 		for _, neighborNode := range neighborNodes {
@@ -324,20 +309,18 @@ func (h *HNSW) searchLayer(query vec.Vector, entryPointIDs []uint64, ef int, lay
 
 			d := h.dist(query, neighborNode.vec)
 
-			// If rp isn't full yet OR this candidate is better than the worst
 			if rp.Len() < ef {
 				cp.Push(candidate{id: neighborID, dist: d})
 				rp.Push(candidate{id: neighborID, dist: d})
 			} else {
 				if root, ok := rp.Peek(); ok && d < root.dist {
 					cp.Push(candidate{id: neighborID, dist: d})
-					rp.Push(candidate{id: neighborID, dist: d}) // rp.Push will replace root if needed
+					rp.Push(candidate{id: neighborID, dist: d})
 				}
 			}
 		}
 	}
 
-	// Return candidate queue & visited map to pools (after clearing visited).
 	cp.Reset()
 	candidatePool.Put(cp)
 
@@ -346,6 +329,5 @@ func (h *HNSW) searchLayer(query vec.Vector, entryPointIDs []uint64, ef int, lay
 	}
 	visitedPool.Put(&visited)
 
-	// Return rp to caller. Caller should consume/pop it.
 	return rp
 }

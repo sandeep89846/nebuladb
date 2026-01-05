@@ -32,18 +32,17 @@ func (h *HNSW) Search(query vec.Vector, k int) ([]Match, error) {
 
 	currObjID := entryPointID
 
-	// 1. Zoom in: Greedy search from Top -> Layer 1
 	for l := maxLevel; l > 0; l-- {
 		res := h.searchLayer(nq, []uint64{currObjID}, 1, l)
 		if res.Len() > 0 {
-			// .Pop() returns the furthest, but since ef=1, the furthest IS the closest.
+
 			currObjID = res.Pop().id
 		}
 		// MEMORY FIX: Return the queue to the pool!
 		resultPool.Put(res)
 	}
 
-	// 2. Layer 0: The Full Search
+	// Layer 0: The Full Search
 	efSearch := h.config.EfSearch
 	if efSearch < k {
 		efSearch = k
@@ -51,7 +50,6 @@ func (h *HNSW) Search(query vec.Vector, k int) ([]Match, error) {
 
 	res := h.searchLayer(nq, []uint64{currObjID}, efSearch, 0)
 
-	// 3. Format Results
 	// res.PopAll() returns Furthest->Closest
 	allCandidates := res.PopAll()
 
@@ -69,7 +67,6 @@ func (h *HNSW) Search(query vec.Vector, k int) ([]Match, error) {
 		externalID := h.internalToID[c.id]
 		h.globalLock.RUnlock()
 
-		// Convert Dist back to Cosine Similarity for the user
 		// Dist = 1 - Sim  =>  Sim = 1 - Dist
 		score := 1.0 - c.dist
 
